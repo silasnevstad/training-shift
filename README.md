@@ -14,7 +14,13 @@ pip install -e .
 
 ## Quick Start
 
-The CLI provides three main commands to run end-to-end experiments:
+Run the interactive demo to see the full pipeline in action:
+
+```bash
+python demo.py
+```
+
+Or use the CLI directly. The CLI provides three main commands to run end-to-end experiments:
 
 ### 1. Scrape Sports Data
 
