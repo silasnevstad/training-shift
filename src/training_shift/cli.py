@@ -6,10 +6,7 @@ import json
 import sys
 from pathlib import Path
 
-# Add data directory to path for scraper imports
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-
-from data.scraper import ScraperFactory
+from training_shift.scraper import ScraperFactory
 from training_shift.dataset import DatasetBuilder
 from training_shift.trainer import BaselineTrainer
 
@@ -316,7 +313,7 @@ def train(
             for season, metrics in shift_results["by_season"].items():
                 click.echo(f"\n  Season {season}:")
                 for key, value in metrics.items():
-                    metric_name = key.replace(season, "").strip("_")
+                    metric_name = key.replace(str(season), "").strip("_")
                     click.echo(f"    {metric_name}: {value:.4f}")
         
         click.echo(f"\n{'='*60}")
