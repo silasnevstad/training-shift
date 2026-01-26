@@ -4,13 +4,19 @@ Basic integration test for the training-shift pipeline.
 import sys
 from pathlib import Path
 
-# Add paths for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+# Add repository root to path
+_repo_root = Path(__file__).parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
 
-from data.scraper import ScraperFactory
-from src.training_shift.dataset import DatasetBuilder
-from src.training_shift.trainer import BaselineTrainer
+# Add src directory to path
+_src_dir = _repo_root / "src"
+if str(_src_dir) not in sys.path:
+    sys.path.insert(0, str(_src_dir))
+
+from training_shift.scraper import ScraperFactory
+from training_shift.dataset import DatasetBuilder
+from training_shift.trainer import BaselineTrainer
 
 
 def test_scraper_factory():

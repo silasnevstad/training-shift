@@ -125,9 +125,9 @@ class BaselineTrainer:
         if self.task == "classification":
             metrics = {
                 f"{split}_accuracy": accuracy_score(y, y_pred),
-                f"{split}_precision": precision_score(y, y_pred, zero_division=0),
-                f"{split}_recall": recall_score(y, y_pred, zero_division=0),
-                f"{split}_f1": f1_score(y, y_pred, zero_division=0),
+                f"{split}_precision": precision_score(y, y_pred, zero_division='warn'),
+                f"{split}_recall": recall_score(y, y_pred, zero_division='warn'),
+                f"{split}_f1": f1_score(y, y_pred, zero_division='warn'),
             }
         else:  # regression
             metrics = {

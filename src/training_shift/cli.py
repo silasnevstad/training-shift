@@ -4,6 +4,7 @@ CLI for training stability experiments under seasonal dataset shift.
 import click
 import json
 import sys
+import pandas as pd
 from pathlib import Path
 
 from training_shift.scraper import ScraperFactory
@@ -259,8 +260,6 @@ def train(
         suffix = f"_drop_{'_'.join(feature_drop_list)}"
     
     try:
-        import pandas as pd
-        
         train_df = pd.read_csv(data_path / f"{sport}_{target}_train{suffix}.csv")
         val_df = pd.read_csv(data_path / f"{sport}_{target}_val{suffix}.csv")
         test_df = pd.read_csv(data_path / f"{sport}_{target}_test{suffix}.csv")
