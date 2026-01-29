@@ -17,6 +17,7 @@ setup(
     entry_points={
         "console_scripts": [
             "training-shift=training_shift.cli:cli",
+            "shiftbench=shiftbench.cli:cli",
         ],
     },
 )
