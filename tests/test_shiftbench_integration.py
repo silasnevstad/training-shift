@@ -40,21 +40,22 @@ class TestIntegration(unittest.TestCase):
         return srv, f"http://{host}:{port}"
 
     def test_nflverse_local(self):
-        release = {"tag_name": "pbp", "assets": [{"name": "play_by_play_2023.csv", "browser_download_url": "", "size": 20}]}
-        csv_body = b"col1,col2\n1,2\n3,4\n"
+        release = {"tag_name": "pbp",
+                   "assets": [{"name": "play_by_play_2023.parquet", "browser_download_url": "", "size": 20}]}
+        body = b"PAR1fakeparquet"
         routes = {}
 
         srv, base = self._start(routes)
-        self.addCleanup(lambda: srv.shutdown())
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
 
-        release["assets"][0]["browser_download_url"] = base + "/asset/pbp2023.csv"
+        release["assets"][0]["browser_download_url"] = base + "/asset/pbp2023.parquet"
         routes["/repos/nflverse/nflverse-data/releases/tags/pbp"] = (200, {"Content-Type": "application/json"}, json.dumps(release).encode("utf-8"))
-        routes["/asset/pbp2023.csv"] = (200, {"Content-Type": "text/csv"}, csv_body)
+        routes["/asset/pbp2023.parquet"] = (200, {"Content-Type": "application/octet-stream"}, body)
 
         cfg = IngestConfig(
             source="nflverse",
             ref="pbp",
-            scope={"datasets": ["play_by_play"], "seasons": [2023]},
+            scope={"datasets": ["play_by_play_parquet"], "seasons": [2023]},
             out_dir=Path(self.tmp) / "data" / "raw",
             cache_dir=Path(self.tmp) / "data" / ".cache" / "shiftbench",
             max_parallel=2,
@@ -69,7 +70,7 @@ class TestIntegration(unittest.TestCase):
     def test_statsbomb_local_optional_360(self):
         routes = {}
         srv, base = self._start(routes)
-        self.addCleanup(lambda: srv.shutdown())
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
 
         sha = "a" * 40
         competitions = [{"competition_id": 1, "season_id": 10}]
