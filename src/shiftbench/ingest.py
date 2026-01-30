@@ -284,7 +284,7 @@ def ingest(cfg: IngestConfig) -> Path:
             return (dest_rel, {"skipped": True, **rec}, None)
 
         try:
-            res = stream_download(url, dest)
+            res = stream_download(url, dest, expected_size_bytes=p.get("expected_size_bytes"))
             return (dest_rel, {"sha256": res.sha256, "size_bytes": res.size_bytes, "mtime_utc": res.mtime_utc, "skipped": False}, None)
         except SBError as e:
             optional = bool(p.get("optional", False))

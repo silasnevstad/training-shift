@@ -43,18 +43,31 @@ class TestIntegration(unittest.TestCase):
         t.start()
         return srv, f"http://{host}:{port}"
 
+    def _route(self, status, headers, body):
+        hdrs = dict(headers)
+        hdrs.setdefault("Content-Length", str(len(body)))
+        return (status, hdrs, body)
+
     def test_nflverse_local(self):
-        release = {"tag_name": "pbp",
-                   "assets": [{"name": "play_by_play_2023.parquet", "browser_download_url": "", "size": 20}]}
         body = b"PAR1fakeparquet"
+        release = {"tag_name": "pbp",
+                   "assets": [{"name": "play_by_play_2023.parquet", "browser_download_url": "", "size": len(body)}]}
         routes = {}
 
         srv, base = self._start(routes)
         self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
 
         release["assets"][0]["browser_download_url"] = base + "/asset/pbp2023.parquet"
-        routes["/repos/nflverse/nflverse-data/releases/tags/pbp"] = (200, {"Content-Type": "application/json"}, json.dumps(release).encode("utf-8"))
-        routes["/asset/pbp2023.parquet"] = (200, {"Content-Type": "application/octet-stream"}, body)
+        routes["/repos/nflverse/nflverse-data/releases/tags/pbp"] = self._route(
+            200,
+            {"Content-Type": "application/json"},
+            json.dumps(release).encode("utf-8"),
+        )
+        routes["/asset/pbp2023.parquet"] = self._route(
+            200,
+            {"Content-Type": "application/octet-stream"},
+            body,
+        )
 
         cfg = IngestConfig(
             source="nflverse",
@@ -82,10 +95,26 @@ class TestIntegration(unittest.TestCase):
         events = [{"id": 1, "type": "Pass"}]
         lineups = [{"team_id": 123}]
 
-        routes[f"/statsbomb/open-data/{sha}/data/competitions.json"] = (200, {"Content-Type": "application/json"}, json.dumps(competitions).encode("utf-8"))
-        routes[f"/statsbomb/open-data/{sha}/data/matches/1/10.json"] = (200, {"Content-Type": "application/json"}, json.dumps(matches).encode("utf-8"))
-        routes[f"/statsbomb/open-data/{sha}/data/events/999.json"] = (200, {"Content-Type": "application/json"}, json.dumps(events).encode("utf-8"))
-        routes[f"/statsbomb/open-data/{sha}/data/lineups/999.json"] = (200, {"Content-Type": "application/json"}, json.dumps(lineups).encode("utf-8"))
+        routes[f"/statsbomb/open-data/{sha}/data/competitions.json"] = self._route(
+            200,
+            {"Content-Type": "application/json"},
+            json.dumps(competitions).encode("utf-8"),
+        )
+        routes[f"/statsbomb/open-data/{sha}/data/matches/1/10.json"] = self._route(
+            200,
+            {"Content-Type": "application/json"},
+            json.dumps(matches).encode("utf-8"),
+        )
+        routes[f"/statsbomb/open-data/{sha}/data/events/999.json"] = self._route(
+            200,
+            {"Content-Type": "application/json"},
+            json.dumps(events).encode("utf-8"),
+        )
+        routes[f"/statsbomb/open-data/{sha}/data/lineups/999.json"] = self._route(
+            200,
+            {"Content-Type": "application/json"},
+            json.dumps(lineups).encode("utf-8"),
+        )
         # 3-sixty route intentionally missing -> 404 optional
 
         cfg = IngestConfig(
