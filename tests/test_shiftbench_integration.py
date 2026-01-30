@@ -7,8 +7,8 @@ import tempfile
 import shutil
 from unittest import mock
 
-from shiftbench.ingest import IngestConfig, ingest
-from shiftbench.errors import SBError, E_UNSAFE_DEST_PATH
+from shiftbench.ingest import IngestConfig, ingest, verify_ingestion_integrity
+from shiftbench.errors import SBError, E_UNSAFE_DEST_PATH, E_JSON_PARSE, E_ASSET_MISSING
 from shiftbench.sources.nflverse import PlanItem
 from shiftbench.util import normalize_scope_obj, scope_fingerprint, sanitize_ref_for_path
 
@@ -131,7 +131,112 @@ class TestIntegration(unittest.TestCase):
         ingest_dir = ingest(cfg)
         man = json.loads((ingest_dir / "manifest.json").read_text(encoding="utf-8"))
         self.assertIn(man["results"]["status"], ["partial", "success"])
+        self.assertEqual(man["results"]["failed_files"], 0)
         self.assertTrue((ingest_dir / "downloads" / f"statsbomb-open-data/{sha}/events/999.json").exists())
+
+    def test_statsbomb_missing_competitions_manifest(self):
+        routes = {}
+        srv, base = self._start(routes)
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+
+        sha = "b" * 40
+        cfg = IngestConfig(
+            source="statsbomb-open-data",
+            ref=sha,
+            scope={"competition_ids": [1], "season_ids": [10]},
+            out_dir=Path(self.tmp) / "data" / "raw",
+            cache_dir=Path(self.tmp) / "data" / ".cache" / "shiftbench",
+            max_parallel=2,
+            dry_run=False,
+            github_raw_base=base,
+            github_api_base=base,
+        )
+        ingest_dir = ingest(cfg)
+        man = json.loads((ingest_dir / "manifest.json").read_text(encoding="utf-8"))
+        codes = {err.get("code") for err in man["results"]["errors"]}
+        self.assertIn(E_ASSET_MISSING, codes)
+
+    def test_statsbomb_invalid_competitions_json_manifest(self):
+        routes = {}
+        srv, base = self._start(routes)
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+
+        sha = "c" * 40
+        routes[f"/statsbomb/open-data/{sha}/data/competitions.json"] = self._route(
+            200,
+            {"Content-Type": "application/json"},
+            b"{not: valid json",
+        )
+
+        cfg = IngestConfig(
+            source="statsbomb-open-data",
+            ref=sha,
+            scope={"competition_ids": [1], "season_ids": [10]},
+            out_dir=Path(self.tmp) / "data" / "raw",
+            cache_dir=Path(self.tmp) / "data" / ".cache" / "shiftbench",
+            max_parallel=2,
+            dry_run=False,
+            github_raw_base=base,
+            github_api_base=base,
+        )
+        ingest_dir = ingest(cfg)
+        man = json.loads((ingest_dir / "manifest.json").read_text(encoding="utf-8"))
+        codes = {err.get("code") for err in man["results"]["errors"]}
+        self.assertIn(E_JSON_PARSE, codes)
+
+    def test_statsbomb_require_360_missing_fails_integrity(self):
+        routes = {}
+        srv, base = self._start(routes)
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+
+        sha = "d" * 40
+        competitions = [{"competition_id": 1, "season_id": 10}]
+        matches = [{"match_id": 999}]
+        events = [{"id": 1, "type": "Pass"}]
+        lineups = [{"team_id": 123}]
+
+        routes[f"/statsbomb/open-data/{sha}/data/competitions.json"] = self._route(
+            200,
+            {"Content-Type": "application/json"},
+            json.dumps(competitions).encode("utf-8"),
+        )
+        routes[f"/statsbomb/open-data/{sha}/data/matches/1/10.json"] = self._route(
+            200,
+            {"Content-Type": "application/json"},
+            json.dumps(matches).encode("utf-8"),
+        )
+        routes[f"/statsbomb/open-data/{sha}/data/events/999.json"] = self._route(
+            200,
+            {"Content-Type": "application/json"},
+            json.dumps(events).encode("utf-8"),
+        )
+        routes[f"/statsbomb/open-data/{sha}/data/lineups/999.json"] = self._route(
+            200,
+            {"Content-Type": "application/json"},
+            json.dumps(lineups).encode("utf-8"),
+        )
+
+        cfg = IngestConfig(
+            source="statsbomb-open-data",
+            ref=sha,
+            scope={"competition_ids": [1], "season_ids": [10]},
+            out_dir=Path(self.tmp) / "data" / "raw",
+            cache_dir=Path(self.tmp) / "data" / ".cache" / "shiftbench",
+            max_parallel=4,
+            dry_run=False,
+            require_360=True,
+            github_raw_base=base,
+            github_api_base=base,
+        )
+        ingest_dir = ingest(cfg)
+        man = json.loads((ingest_dir / "manifest.json").read_text(encoding="utf-8"))
+        ok, errs = verify_ingestion_integrity(
+            ingest_dir,
+            require_360=bool(man.get("config", {}).get("require_360")),
+            resolved_plan=man.get("resolved_plan") or [],
+        )
+        self.assertFalse(ok)
+        self.assertIn("E_REQUIRED_ASSET_MISSING", {err.get("code") for err in errs})
 
     def test_rejects_unsafe_dest_path(self):
         scope = {"datasets": ["play_by_play_parquet"], "seasons": [2023]}

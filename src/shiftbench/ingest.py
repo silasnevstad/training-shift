@@ -23,6 +23,7 @@ from .schema import infer_schema_for_file, build_drift_report
 from .sources.nflverse import NFLVerseResolver
 from .sources.statsbomb_open_data import StatsBombOpenDataResolver
 
+
 @dataclass
 class IngestConfig:
     source: str
@@ -38,6 +39,7 @@ class IngestConfig:
     github_api_base: str = "https://api.github.com"
     github_raw_base: str = "https://raw.githubusercontent.com"
 
+
 def _terms_and_attribution(source: str) -> Dict[str, Any]:
     if source == "statsbomb-open-data":
         return {
@@ -45,7 +47,8 @@ def _terms_and_attribution(source: str) -> Dict[str, Any]:
                 "If you publish/ship results, attribute StatsBomb as the data source and use their logo per their open-data README.",
             ],
             "sources": [
-                {"name": "StatsBomb Open Data", "url": "https://github.com/statsbomb/open-data", "notes": "Attribution required."},
+                {"name": "StatsBomb Open Data", "url": "https://github.com/statsbomb/open-data",
+                 "notes": "Attribution required."},
             ],
         }
     if source == "nflverse":
@@ -54,10 +57,12 @@ def _terms_and_attribution(source: str) -> Dict[str, Any]:
                 "Attribute nflverse and underlying dataset authors as applicable.",
             ],
             "sources": [
-                {"name": "nflverse-data", "url": "https://github.com/nflverse/nflverse-data", "notes": "Data stored in GitHub releases assets."},
+                {"name": "nflverse-data", "url": "https://github.com/nflverse/nflverse-data",
+                 "notes": "Data stored in GitHub releases assets."},
             ],
         }
     return {"requirements": [], "sources": []}
+
 
 def _hash_file_sha256(path: Path) -> str:
     import hashlib
@@ -67,36 +72,42 @@ def _hash_file_sha256(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
 def _safe_download_path(downloads_dir: Path, dest_rel: str) -> Path:
     if not dest_rel:
-        raise SBError(E_UNSAFE_DEST_PATH, "Empty dest_path rejected", detail={"dest_path": dest_rel}, retryable=False, severity="fatal")
+        raise SBError(E_UNSAFE_DEST_PATH, "Empty dest_path rejected", detail={"dest_path": dest_rel}, retryable=False,
+                      severity="fatal")
     rel_path = Path(dest_rel)
     if rel_path.is_absolute():
-        raise SBError(E_UNSAFE_DEST_PATH, "Absolute dest_path rejected", detail={"dest_path": dest_rel}, retryable=False, severity="fatal")
+        raise SBError(E_UNSAFE_DEST_PATH, "Absolute dest_path rejected", detail={"dest_path": dest_rel},
+                      retryable=False, severity="fatal")
     base = downloads_dir.resolve()
     dest = (downloads_dir / rel_path).resolve()
     try:
         dest.relative_to(base)
     except ValueError:
-        raise SBError(E_UNSAFE_DEST_PATH, "dest_path escapes downloads_dir", detail={"dest_path": dest_rel}, retryable=False, severity="fatal")
+        raise SBError(E_UNSAFE_DEST_PATH, "dest_path escapes downloads_dir", detail={"dest_path": dest_rel},
+                      retryable=False, severity="fatal")
     return dest
 
+
 def _build_manifest(
-    *,
-    run_id: str,
-    started_at: str,
-    finished_at: str,
-    source: str,
-    source_ref: str,
-    requested_scope: Dict[str, Any],
-    resolved_plan: List[Dict[str, Any]],
-    status: str,
-    downloaded_files: int,
-    skipped_files: int,
-    failed_files: int,
-    errors: List[Dict[str, Any]],
-    env: Dict[str, Any],
-    terms: Dict[str, Any],
+        *,
+        run_id: str,
+        started_at: str,
+        finished_at: str,
+        source: str,
+        source_ref: str,
+        requested_scope: Dict[str, Any],
+        resolved_plan: List[Dict[str, Any]],
+        status: str,
+        downloaded_files: int,
+        skipped_files: int,
+        failed_files: int,
+        errors: List[Dict[str, Any]],
+        env: Dict[str, Any],
+        terms: Dict[str, Any],
+        config: Dict[str, Any],
 ) -> Dict[str, Any]:
     return {
         "schema_version": "1",
@@ -106,6 +117,7 @@ def _build_manifest(
         "source": source,
         "source_ref": source_ref,
         "requested_scope": requested_scope,
+        "config": config,
         "resolved_plan": resolved_plan,
         "results": {
             "status": status,
@@ -117,6 +129,7 @@ def _build_manifest(
         "environment": env,
         "terms_and_attribution": terms,
     }
+
 
 def ingest(cfg: IngestConfig) -> Path:
     run_id = str(uuid.uuid4())
@@ -226,7 +239,8 @@ def ingest(cfg: IngestConfig) -> Path:
                 "optional": it.optional,
             })
     else:
-        raise SBError("E_SCOPE_INVALID", "Unknown source", detail={"source": cfg.source}, retryable=False, severity="fatal")
+        raise SBError("E_SCOPE_INVALID", "Unknown source", detail={"source": cfg.source}, retryable=False,
+                      severity="fatal")
 
     logger.event("resolve", "resolve_ok", planned_files=len([p for p in resolved_plan if p.get("url")]))
 
@@ -246,6 +260,7 @@ def ingest(cfg: IngestConfig) -> Path:
             source_ref=source_ref_resolved,
             requested_scope=norm_scope,
             resolved_plan=resolved_plan,
+            config={"require_360": cfg.require_360},
             status="success",
             downloaded_files=0,
             skipped_files=0,
@@ -285,16 +300,39 @@ def ingest(cfg: IngestConfig) -> Path:
 
         try:
             res = stream_download(url, dest, expected_size_bytes=p.get("expected_size_bytes"))
-            return (dest_rel, {"sha256": res.sha256, "size_bytes": res.size_bytes, "mtime_utc": res.mtime_utc, "skipped": False}, None)
+            return (dest_rel,
+                    {"sha256": res.sha256, "size_bytes": res.size_bytes, "mtime_utc": res.mtime_utc, "skipped": False},
+                    None)
         except SBError as e:
             optional = bool(p.get("optional", False))
+            # Optional policy: only HTTP 404s are non-gating for optional assets.
             if p.get("group") == "three-sixty" and cfg.require_360:
                 optional = False
             if optional and e.code == E_HTTP_404:
                 warn = e.to_manifest_record()
                 warn["detail"]["optional"] = True
-                return (dest_rel, None, warn)
-            return (dest_rel, None, e.to_manifest_record())
+                return dest_rel, None, warn
+            return dest_rel, None, e.to_manifest_record()
+
+    def _handle_download_result(logical, dest_rel, checksum_rec, err_rec):
+        nonlocal downloaded, skipped, failed
+        if err_rec:
+            if err_rec.get("detail", {}).get("optional"):
+                errors.append(err_rec)
+                logger.warn("download", "optional_missing", logical_name=logical, error=err_rec)
+            else:
+                errors.append(err_rec)
+                failed += 1
+                logger.error("download", "download_failed", logical_name=logical, error=err_rec)
+        if checksum_rec:
+            if checksum_rec.get("skipped"):
+                skipped += 1
+            else:
+                downloaded += 1
+            checksums[dest_rel] = {"sha256": checksum_rec["sha256"], "size_bytes": checksum_rec["size_bytes"],
+                                   "mtime_utc": checksum_rec["mtime_utc"]}
+            logger.event("download", "download_ok" if not checksum_rec.get("skipped") else "download_skipped",
+                         logical_name=logical, dest_path=dest_rel)
 
     planned = [p for p in resolved_plan if p.get("url")]
     logger.event("download", "download_start", planned=len(planned))
@@ -305,94 +343,75 @@ def ingest(cfg: IngestConfig) -> Path:
             p = futs[fut]
             logical = p.get("logical_name")
             dest_rel, checksum_rec, err_rec = fut.result()
-            if err_rec:
-                if err_rec.get("detail", {}).get("optional"):
-                    errors.append(err_rec)
-                    logger.warn("download", "optional_missing", logical_name=logical, error=err_rec)
-                else:
-                    errors.append(err_rec)
-                    failed += 1
-                    logger.error("download", "download_failed", logical_name=logical, error=err_rec)
-            if checksum_rec:
-                if checksum_rec.get("skipped"):
-                    skipped += 1
-                else:
-                    downloaded += 1
-                checksums[dest_rel] = {"sha256": checksum_rec["sha256"], "size_bytes": checksum_rec["size_bytes"], "mtime_utc": checksum_rec["mtime_utc"]}
-                logger.event("download", "download_ok" if not checksum_rec.get("skipped") else "download_skipped", logical_name=logical, dest_path=dest_rel)
+            _handle_download_result(logical, dest_rel, checksum_rec, err_rec)
 
     # StatsBomb expansion: pairs -> matches -> match artifacts
     if cfg.source == "statsbomb-open-data":
         resolver = StatsBombOpenDataResolver(gh, raw_base=cfg.github_raw_base)
         comp_path = downloads_dir / f"statsbomb-open-data/{source_ref_resolved}/competitions.json"
-        pairs = resolver.expand_pairs_from_competitions(comp_path, norm_scope)
-        match_files = resolver.plan_matches_files(source_ref_resolved, pairs)
-        match_plan = []
-        for it in match_files:
-            match_plan.append({
-                "logical_name": it.logical_name,
-                "url": it.url,
-                "dest_path": it.dest_path,
-                "expected_type": it.expected_type,
-                "expected_size_bytes": it.expected_size_bytes,
-                "sha256": it.sha256,
-                "group": it.group,
-                "optional": it.optional,
-            })
-        # Download matches files
-        with ThreadPoolExecutor(max_workers=max(1, int(cfg.max_parallel))) as ex:
-            futs = {ex.submit(_download_one, p): p for p in match_plan}
-            for fut in as_completed(futs):
-                p = futs[fut]
-                logical = p.get("logical_name")
-                dest_rel, checksum_rec, err_rec = fut.result()
-                if err_rec:
-                    errors.append(err_rec); failed += 1
-                    logger.error("download", "download_failed", logical_name=logical, error=err_rec)
-                if checksum_rec:
-                    if checksum_rec.get("skipped"): skipped += 1
-                    else: downloaded += 1
-                    checksums[dest_rel] = {"sha256": checksum_rec["sha256"], "size_bytes": checksum_rec["size_bytes"], "mtime_utc": checksum_rec["mtime_utc"]}
-        resolved_plan.extend(match_plan)
+        try:
+            pairs = resolver.expand_pairs_from_competitions(comp_path, norm_scope)
+            match_files = resolver.plan_matches_files(source_ref_resolved, pairs)
+            match_plan = []
+            for it in match_files:
+                match_plan.append({
+                    "logical_name": it.logical_name,
+                    "url": it.url,
+                    "dest_path": it.dest_path,
+                    "expected_type": it.expected_type,
+                    "expected_size_bytes": it.expected_size_bytes,
+                    "sha256": it.sha256,
+                    "group": it.group,
+                    "optional": it.optional,
+                })
+            # Download matches files
+            with ThreadPoolExecutor(max_workers=max(1, int(cfg.max_parallel))) as ex:
+                futs = {ex.submit(_download_one, p): p for p in match_plan}
+                for fut in as_completed(futs):
+                    p = futs[fut]
+                    logical = p.get("logical_name")
+                    dest_rel, checksum_rec, err_rec = fut.result()
+                    _handle_download_result(logical, dest_rel, checksum_rec, err_rec)
+            resolved_plan.extend(match_plan)
 
-        # Extract match ids and download artifacts
-        match_ids = []
-        for p in match_plan:
-            dest = _safe_download_path(downloads_dir, str(p["dest_path"]))
-            if dest.exists():
-                match_ids.extend(resolver.extract_match_ids(dest))
-        match_ids = sorted(set(match_ids))
-        artifacts = resolver.plan_match_artifacts(source_ref_resolved, match_ids)
-        art_plan = []
-        for it in artifacts:
-            art_plan.append({
-                "logical_name": it.logical_name,
-                "url": it.url,
-                "dest_path": it.dest_path,
-                "expected_type": it.expected_type,
-                "expected_size_bytes": it.expected_size_bytes,
-                "sha256": it.sha256,
-                "group": it.group,
-                "optional": it.optional,
-            })
-        with ThreadPoolExecutor(max_workers=max(1, int(cfg.max_parallel))) as ex:
-            futs = {ex.submit(_download_one, p): p for p in art_plan}
-            for fut in as_completed(futs):
-                p = futs[fut]
-                logical = p.get("logical_name")
-                dest_rel, checksum_rec, err_rec = fut.result()
-                if err_rec:
-                    if err_rec.get("detail", {}).get("optional"):
-                        errors.append(err_rec)
-                        logger.warn("download", "optional_missing", logical_name=logical, error=err_rec)
-                    else:
-                        errors.append(err_rec); failed += 1
-                        logger.error("download", "download_failed", logical_name=logical, error=err_rec)
-                if checksum_rec:
-                    if checksum_rec.get("skipped"): skipped += 1
-                    else: downloaded += 1
-                    checksums[dest_rel] = {"sha256": checksum_rec["sha256"], "size_bytes": checksum_rec["size_bytes"], "mtime_utc": checksum_rec["mtime_utc"]}
-        resolved_plan.extend(art_plan)
+            # Extract match ids and download artifacts
+            match_ids = []
+            for p in match_plan:
+                dest = _safe_download_path(downloads_dir, str(p["dest_path"]))
+                if dest.exists():
+                    match_ids.extend(resolver.extract_match_ids(dest))
+            match_ids = sorted(set(match_ids))
+            artifacts = resolver.plan_match_artifacts(source_ref_resolved, match_ids)
+            art_plan = []
+            for it in artifacts:
+                art_plan.append({
+                    "logical_name": it.logical_name,
+                    "url": it.url,
+                    "dest_path": it.dest_path,
+                    "expected_type": it.expected_type,
+                    "expected_size_bytes": it.expected_size_bytes,
+                    "sha256": it.sha256,
+                    "group": it.group,
+                    "optional": it.optional,
+                })
+            with ThreadPoolExecutor(max_workers=max(1, int(cfg.max_parallel))) as ex:
+                futs = {ex.submit(_download_one, p): p for p in art_plan}
+                for fut in as_completed(futs):
+                    p = futs[fut]
+                    logical = p.get("logical_name")
+                    dest_rel, checksum_rec, err_rec = fut.result()
+                    _handle_download_result(logical, dest_rel, checksum_rec, err_rec)
+            resolved_plan.extend(art_plan)
+        except SBError as e:
+            errors.append(e.to_manifest_record())
+            failed += 1
+            logger.error("resolve", "expansion_failed", error=e.to_manifest_record())
+        except Exception as e:
+            sb = SBError("E_EXPANSION_FAILED", "StatsBomb expansion failed", detail=str(e), retryable=False,
+                         severity="fatal")
+            errors.append(sb.to_manifest_record())
+            failed += 1
+            logger.error("resolve", "expansion_failed", error=sb.to_manifest_record())
 
     # Persist checksums
     atomic_write_json(checksums_path, checksums)
@@ -432,6 +451,7 @@ def ingest(cfg: IngestConfig) -> Path:
         source=cfg.source,
         source_ref=source_ref_resolved,
         requested_scope=norm_scope,
+        config={"require_360": cfg.require_360},
         resolved_plan=resolved_plan,
         status=status,
         downloaded_files=downloaded,
@@ -445,7 +465,13 @@ def ingest(cfg: IngestConfig) -> Path:
     logger.event("finalize", "ingest_complete", status=status, downloaded=downloaded, skipped=skipped, failed=failed)
     return ingest_dir
 
-def verify_ingestion_integrity(ingest_dir: Path) -> Tuple[bool, List[Dict[str, Any]]]:
+
+def verify_ingestion_integrity(
+        ingest_dir: Path,
+        *,
+        require_360: bool = False,
+        resolved_plan: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[bool, List[Dict[str, Any]]]:
     errors: List[Dict[str, Any]] = []
     checksums_path = ingest_dir / "checksums.json"
     downloads_dir = ingest_dir / "downloads"
@@ -463,10 +489,40 @@ def verify_ingestion_integrity(ingest_dir: Path) -> Tuple[bool, List[Dict[str, A
             continue
         if not dest.exists():
             ok = False
-            errors.append({"code": "E_FILE_MISSING", "message": "Downloaded file missing", "detail": {"dest_path": dest_rel}})
+            errors.append(
+                {"code": "E_FILE_MISSING", "message": "Downloaded file missing", "detail": {"dest_path": dest_rel}})
             continue
         sha = _hash_file_sha256(dest)
         if sha != rec.get("sha256"):
             ok = False
-            errors.append({"code": "E_CHECKSUM_MISMATCH", "message": "Checksum mismatch", "detail": {"dest_path": dest_rel, "expected": rec.get("sha256"), "actual": sha}})
+            errors.append({"code": "E_CHECKSUM_MISMATCH", "message": "Checksum mismatch",
+                           "detail": {"dest_path": dest_rel, "expected": rec.get("sha256"), "actual": sha}})
+    if require_360:
+        for item in resolved_plan or []:
+            if item.get("group") != "three-sixty":
+                continue
+            dest_rel = str(item.get("dest_path") or "")
+            if not dest_rel:
+                continue
+            try:
+                dest = _safe_download_path(downloads_dir, dest_rel)
+            except SBError as e:
+                ok = False
+                errors.append(e.to_manifest_record())
+                continue
+            if not dest.exists():
+                ok = False
+                errors.append({
+                    "code": "E_REQUIRED_ASSET_MISSING",
+                    "message": "Required three-sixty asset missing",
+                    "detail": {"dest_path": dest_rel},
+                })
+                continue
+            if dest_rel not in checksums:
+                ok = False
+                errors.append({
+                    "code": "E_CHECKSUM_RECORD_MISSING",
+                    "message": "Checksum record missing for required asset",
+                    "detail": {"dest_path": dest_rel},
+                })
     return ok, errors

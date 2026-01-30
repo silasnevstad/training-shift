@@ -4,9 +4,10 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..errors import SBError, E_SCOPE_INVALID, E_FLOATING_REF_DISALLOWED
+from ..errors import SBError, E_SCOPE_INVALID, E_FLOATING_REF_DISALLOWED, E_ASSET_MISSING, E_JSON_PARSE
 from ..github import GitHubClient
 from ..util import is_probably_commit_sha
+
 
 @dataclass
 class PlanItem:
@@ -22,11 +23,14 @@ class PlanItem:
     match_id: Optional[int] = None
     optional: bool = False
 
+
 def _raw_url(owner: str, repo: str, sha: str, path: str, *, raw_base: str) -> str:
     return f"{raw_base}/{owner}/{repo}/{sha}/{path}"
 
+
 class StatsBombOpenDataResolver:
-    def __init__(self, gh: GitHubClient, *, owner: str = "statsbomb", repo: str = "open-data", raw_base: str = "https://raw.githubusercontent.com"):
+    def __init__(self, gh: GitHubClient, *, owner: str = "statsbomb", repo: str = "open-data",
+                 raw_base: str = "https://raw.githubusercontent.com"):
         self.gh = gh
         self.owner = owner
         self.repo = repo
@@ -37,7 +41,9 @@ class StatsBombOpenDataResolver:
             commit_sha = ref.strip()
         else:
             if not allow_floating:
-                raise SBError(E_FLOATING_REF_DISALLOWED, "Floating ref disallowed for statsbomb-open-data; use a commit SHA", detail={"ref": ref}, retryable=False, severity="fatal")
+                raise SBError(E_FLOATING_REF_DISALLOWED,
+                              "Floating ref disallowed for statsbomb-open-data; use a commit SHA", detail={"ref": ref},
+                              retryable=False, severity="fatal")
             commit_sha = self.gh.resolve_ref_to_commit(self.owner, self.repo, ref)
 
         plan: List[PlanItem] = []
@@ -67,23 +73,38 @@ class StatsBombOpenDataResolver:
         return commit_sha, plan
 
     def expand_pairs_from_competitions(self, competitions_json_path, scope: Dict[str, Any]) -> List[Tuple[int, int]]:
-        data = json.loads(competitions_json_path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(competitions_json_path.read_text(encoding="utf-8"))
+        except FileNotFoundError as e:
+            raise SBError(E_ASSET_MISSING, "competitions.json missing", detail=str(e), path=str(competitions_json_path),
+                          retryable=False, severity="fatal")
+        except json.JSONDecodeError as e:
+            raise SBError(E_JSON_PARSE, "competitions.json invalid JSON", detail=str(e),
+                          path=str(competitions_json_path), retryable=False, severity="fatal")
         if not isinstance(data, list):
-            raise SBError(E_SCOPE_INVALID, "competitions.json not a list", detail={"type": str(type(data))}, retryable=False, severity="fatal")
+            raise SBError(E_SCOPE_INVALID, "competitions.json not a list", detail={"type": str(type(data))},
+                          retryable=False, severity="fatal")
         comp_ids = scope.get("competition_ids")
         season_ids = scope.get("season_ids")
         pairs_scope = scope.get("competition_season_ids")
         if pairs_scope is not None:
             pairs = []
-            for p in pairs_scope:
-                pairs.append((int(p["competition_id"]), int(p["season_id"])))
+            try:
+                for p in pairs_scope:
+                    pairs.append((int(p["competition_id"]), int(p["season_id"])))
+            except (KeyError, TypeError, ValueError) as e:
+                raise SBError(E_SCOPE_INVALID,
+                              "competition_season_ids entries must include competition_id and season_id", detail=str(e),
+                              retryable=False, severity="fatal")
             pairs = sorted(set(pairs))
             if not pairs:
-                raise SBError(E_SCOPE_INVALID, "No competition_season_ids provided", detail=scope, retryable=False, severity="fatal")
+                raise SBError(E_SCOPE_INVALID, "No competition_season_ids provided", detail=scope, retryable=False,
+                              severity="fatal")
             return pairs
 
         if comp_ids is None and season_ids is None:
-            raise SBError(E_SCOPE_INVALID, "Provide competition_season_ids or competition_ids/season_ids filters", detail=scope, retryable=False, severity="fatal")
+            raise SBError(E_SCOPE_INVALID, "Provide competition_season_ids or competition_ids/season_ids filters",
+                          detail=scope, retryable=False, severity="fatal")
         comp_set = set(int(x) for x in comp_ids) if isinstance(comp_ids, list) else None
         season_set = set(int(x) for x in season_ids) if isinstance(season_ids, list) else None
         pairs = []
@@ -94,7 +115,8 @@ class StatsBombOpenDataResolver:
             sid = row.get("season_id")
             if cid is None or sid is None:
                 continue
-            cid = int(cid); sid = int(sid)
+            cid = int(cid);
+            sid = int(sid)
             if comp_set is not None and cid not in comp_set:
                 continue
             if season_set is not None and sid not in season_set:
@@ -102,7 +124,8 @@ class StatsBombOpenDataResolver:
             pairs.append((cid, sid))
         pairs = sorted(set(pairs))
         if not pairs:
-            raise SBError(E_SCOPE_INVALID, "No competition/season pairs matched filters", detail=scope, retryable=False, severity="fatal")
+            raise SBError(E_SCOPE_INVALID, "No competition/season pairs matched filters", detail=scope, retryable=False,
+                          severity="fatal")
         return pairs
 
     def plan_matches_files(self, commit_sha: str, pairs: List[Tuple[int, int]]) -> List[PlanItem]:

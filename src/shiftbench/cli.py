@@ -79,7 +79,13 @@ def build_dataset_cmd(ingest_dir: str, allow_floating: bool) -> None:
                 click.echo("Floating ref disallowed: statsbomb-open-data source_ref is not a 40-char commit SHA.", err=True)
                 sys.exit(2)
 
-    ok, errs = verify_ingestion_integrity(p)
+    config = manifest.get("config") or {}
+    require_360 = bool(config.get("require_360", False))
+    ok, errs = verify_ingestion_integrity(
+        p,
+        require_360=require_360,
+        resolved_plan=manifest.get("resolved_plan") or [],
+    )
     if not ok:
         click.echo(json.dumps({"integrity": "failed", "errors": errs}, indent=2), err=True)
         sys.exit(2)
