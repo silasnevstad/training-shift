@@ -5,8 +5,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import tempfile
 import shutil
+from unittest import mock
 
 from shiftbench.ingest import IngestConfig, ingest
+from shiftbench.errors import SBError, E_UNSAFE_DEST_PATH
+from shiftbench.sources.nflverse import PlanItem
+from shiftbench.util import normalize_scope_obj, scope_fingerprint, sanitize_ref_for_path
 
 class Handler(BaseHTTPRequestHandler):
     routes = {}
@@ -99,6 +103,42 @@ class TestIntegration(unittest.TestCase):
         man = json.loads((ingest_dir / "manifest.json").read_text(encoding="utf-8"))
         self.assertIn(man["results"]["status"], ["partial", "success"])
         self.assertTrue((ingest_dir / "downloads" / f"statsbomb-open-data/{sha}/events/999.json").exists())
+
+    def test_rejects_unsafe_dest_path(self):
+        scope = {"datasets": ["play_by_play_parquet"], "seasons": [2023]}
+        out_dir = Path(self.tmp) / "data" / "raw"
+        cfg = IngestConfig(
+            source="nflverse",
+            ref="pbp",
+            scope=scope,
+            out_dir=out_dir,
+            cache_dir=Path(self.tmp) / "data" / ".cache" / "shiftbench",
+            max_parallel=1,
+            dry_run=False,
+            github_api_base="http://example.invalid",
+        )
+        bad_plan = [
+            PlanItem(
+                logical_name="bad",
+                url="http://example.invalid/evil",
+                dest_path="../escape.txt",
+                expected_type="csv",
+                expected_size_bytes=1,
+                sha256=None,
+                group="bad",
+                season=2023,
+            )
+        ]
+        with mock.patch("shiftbench.ingest.NFLVerseResolver.resolve", return_value=("pbp", bad_plan)):
+            with self.assertRaises(SBError) as ctx:
+                ingest(cfg)
+        self.assertEqual(ctx.exception.code, E_UNSAFE_DEST_PATH)
+
+        scope_fp = scope_fingerprint(normalize_scope_obj(scope))
+        source_ref_for_path = sanitize_ref_for_path("pbp")
+        ingest_dir = out_dir / "nflverse" / source_ref_for_path / scope_fp
+        escape_path = ingest_dir / "escape.txt"
+        self.assertFalse(escape_path.exists())
 
 if __name__ == "__main__":
     unittest.main()

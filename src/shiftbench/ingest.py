@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .errors import SBError, E_HTTP_404, E_FLOATING_REF_DISALLOWED
+from .errors import SBError, E_HTTP_404, E_FLOATING_REF_DISALLOWED, E_UNSAFE_DEST_PATH
 from .util import (
     utc_now_iso,
     scope_fingerprint,
@@ -66,6 +66,20 @@ def _hash_file_sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+def _safe_download_path(downloads_dir: Path, dest_rel: str) -> Path:
+    if not dest_rel:
+        raise SBError(E_UNSAFE_DEST_PATH, "Empty dest_path rejected", detail={"dest_path": dest_rel}, retryable=False, severity="fatal")
+    rel_path = Path(dest_rel)
+    if rel_path.is_absolute():
+        raise SBError(E_UNSAFE_DEST_PATH, "Absolute dest_path rejected", detail={"dest_path": dest_rel}, retryable=False, severity="fatal")
+    base = downloads_dir.resolve()
+    dest = (downloads_dir / rel_path).resolve()
+    try:
+        dest.relative_to(base)
+    except ValueError:
+        raise SBError(E_UNSAFE_DEST_PATH, "dest_path escapes downloads_dir", detail={"dest_path": dest_rel}, retryable=False, severity="fatal")
+    return dest
 
 def _build_manifest(
     *,
@@ -216,6 +230,12 @@ def ingest(cfg: IngestConfig) -> Path:
 
     logger.event("resolve", "resolve_ok", planned_files=len([p for p in resolved_plan if p.get("url")]))
 
+    for p in resolved_plan:
+        dest_rel = p.get("dest_path")
+        if not dest_rel:
+            continue
+        _safe_download_path(downloads_dir, str(dest_rel))
+
     if cfg.dry_run:
         finished = utc_now_iso()
         manifest = _build_manifest(
@@ -254,7 +274,10 @@ def ingest(cfg: IngestConfig) -> Path:
         if not url:
             return ("", None, None)
         dest_rel = str(p["dest_path"])
-        dest = downloads_dir / dest_rel
+        try:
+            dest = _safe_download_path(downloads_dir, dest_rel)
+        except SBError as e:
+            return (dest_rel, None, e.to_manifest_record())
 
         rec = checksums.get(dest_rel)
         if dest.exists() and rec and rec.get("sha256"):
@@ -335,7 +358,7 @@ def ingest(cfg: IngestConfig) -> Path:
         # Extract match ids and download artifacts
         match_ids = []
         for p in match_plan:
-            dest = downloads_dir / p["dest_path"]
+            dest = _safe_download_path(downloads_dir, str(p["dest_path"]))
             if dest.exists():
                 match_ids.extend(resolver.extract_match_ids(dest))
         match_ids = sorted(set(match_ids))
@@ -386,7 +409,7 @@ def ingest(cfg: IngestConfig) -> Path:
         dest_rel = p.get("dest_path")
         if not dest_rel:
             continue
-        dest = downloads_dir / str(dest_rel)
+        dest = _safe_download_path(downloads_dir, str(dest_rel))
         if not dest.exists():
             continue
         try:
@@ -432,7 +455,12 @@ def verify_ingestion_integrity(ingest_dir: Path) -> Tuple[bool, List[Dict[str, A
     checksums = json.loads(checksums_path.read_text(encoding="utf-8"))
     ok = True
     for dest_rel, rec in checksums.items():
-        dest = downloads_dir / dest_rel
+        try:
+            dest = _safe_download_path(downloads_dir, str(dest_rel))
+        except SBError as e:
+            ok = False
+            errors.append(e.to_manifest_record())
+            continue
         if not dest.exists():
             ok = False
             errors.append({"code": "E_FILE_MISSING", "message": "Downloaded file missing", "detail": {"dest_path": dest_rel}})
