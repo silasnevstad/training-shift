@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import shutil
 
-from src.shiftbench.ingest import IngestConfig, ingest
+from shiftbench.ingest import IngestConfig, ingest
 
 class Handler(BaseHTTPRequestHandler):
     routes = {}

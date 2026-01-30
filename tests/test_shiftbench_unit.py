@@ -1,9 +1,9 @@
 import unittest
 
-from src.shiftbench.util import scope_fingerprint, normalize_scope_obj
-from src.shiftbench.sources.nflverse import NFLVerseResolver
-from src.shiftbench.github import GitHubClient
-from src.shiftbench.errors import SBError, E_AMBIGUOUS_MATCH, E_ASSET_MISSING
+from shiftbench.util import scope_fingerprint, normalize_scope_obj
+from shiftbench.sources.nflverse import NFLVerseResolver
+from shiftbench.github import GitHubClient
+from shiftbench.errors import SBError, E_AMBIGUOUS_MATCH, E_ASSET_MISSING
 
 class FakeGitHub(GitHubClient):
     def __init__(self, release_payload):
