@@ -7,10 +7,21 @@ import tempfile
 import shutil
 from unittest import mock
 
+from click.testing import CliRunner
+
 from shiftbench.ingest import IngestConfig, ingest, verify_ingestion_integrity
-from shiftbench.errors import SBError, E_UNSAFE_DEST_PATH, E_JSON_PARSE, E_ASSET_MISSING
+from shiftbench.errors import (
+    SBError,
+    E_UNSAFE_DEST_PATH,
+    E_JSON_PARSE,
+    E_ASSET_MISSING,
+    E_REQUIRED_ASSET_MISSING,
+    E_CHECKSUM_RECORD_MISSING,
+)
+from shiftbench.cli import cli
 from shiftbench.sources.nflverse import PlanItem
 from shiftbench.util import normalize_scope_obj, scope_fingerprint, sanitize_ref_for_path
+
 
 class Handler(BaseHTTPRequestHandler):
     routes = {}
@@ -29,6 +40,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         return
+
 
 class TestIntegration(unittest.TestCase):
     def setUp(self):
@@ -50,8 +62,10 @@ class TestIntegration(unittest.TestCase):
 
     def test_nflverse_local(self):
         body = b"PAR1fakeparquet"
-        release = {"tag_name": "pbp",
-                   "assets": [{"name": "play_by_play_2023.parquet", "browser_download_url": "", "size": len(body)}]}
+        release = {
+            "tag_name": "pbp",
+            "assets": [{"name": "play_by_play_2023.parquet", "browser_download_url": "", "size": len(body)}],
+        }
         routes = {}
 
         srv, base = self._start(routes)
@@ -130,9 +144,52 @@ class TestIntegration(unittest.TestCase):
         )
         ingest_dir = ingest(cfg)
         man = json.loads((ingest_dir / "manifest.json").read_text(encoding="utf-8"))
-        self.assertIn(man["results"]["status"], ["partial", "success"])
-        self.assertEqual(man["results"]["failed_files"], 0)
+
+        # Optional three-sixty missing should yield a partial ingest (not success).
+        self.assertEqual(man["results"]["status"], "partial")
+        self.assertEqual(man["results"]["failed_files"], 0)  # optional missing is non-gating
         self.assertTrue((ingest_dir / "downloads" / f"statsbomb-open-data/{sha}/events/999.json").exists())
+        self.assertTrue((ingest_dir / "downloads" / f"statsbomb-open-data/{sha}/lineups/999.json").exists())
+
+        # Ensure the missing optional is recorded and attributable to the planned three-sixty artifact.
+        opt_errs = [
+            e for e in (man.get("results") or {}).get("errors", []) if (e.get("detail") or {}).get("optional")
+        ]
+        self.assertEqual(len(opt_errs), 1)
+        self.assertEqual(opt_errs[0].get("code"), "E_HTTP_404")
+
+        expected_three_dest = f"statsbomb-open-data/{sha}/three-sixty/999.json"
+        three_plan = [
+            p
+            for p in (man.get("resolved_plan") or [])
+            if p.get("group") == "three-sixty" and p.get("dest_path") == expected_three_dest
+        ]
+        self.assertEqual(len(three_plan), 1)
+        self.assertTrue(bool(three_plan[0].get("optional", False)))
+
+        # Error must correspond to the planned three-sixty URL (deterministically links plan→error).
+        self.assertEqual(opt_errs[0].get("url"), three_plan[0].get("url"))
+        self.assertFalse((ingest_dir / "downloads" / expected_three_dest).exists())
+
+    def test_manifest_terms_include_statsbomb_attribution_requirement(self):
+        sha = "e" * 40
+        cfg = IngestConfig(
+            source="statsbomb-open-data",
+            ref=sha,
+            scope={"competition_ids": [1], "season_ids": [10]},
+            out_dir=Path(self.tmp) / "data" / "raw",
+            cache_dir=Path(self.tmp) / "data" / ".cache" / "shiftbench",
+            max_parallel=1,
+            dry_run=True,
+            github_raw_base="http://example.invalid",
+            github_api_base="http://example.invalid",
+        )
+        ingest_dir = ingest(cfg)
+        man = json.loads((ingest_dir / "manifest.json").read_text(encoding="utf-8"))
+        terms = man.get("terms_and_attribution") or {}
+        reqs = " ".join(terms.get("requirements") or []).lower()
+        self.assertIn("statsbomb", reqs)
+        self.assertIn("logo", reqs)
 
     def test_statsbomb_missing_competitions_manifest(self):
         routes = {}
@@ -236,7 +293,79 @@ class TestIntegration(unittest.TestCase):
             resolved_plan=man.get("resolved_plan") or [],
         )
         self.assertFalse(ok)
-        self.assertIn("E_REQUIRED_ASSET_MISSING", {err.get("code") for err in errs})
+        self.assertIn(E_REQUIRED_ASSET_MISSING, {err.get("code") for err in errs})
+
+    def test_integrity_missing_required_planned_file(self):
+        ingest_dir = Path(self.tmp) / "ingest"
+        downloads_dir = ingest_dir / "downloads"
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "schema_version": "1",
+            "run_id": "run",
+            "started_at_utc": "now",
+            "finished_at_utc": "later",
+            "source": "nflverse",
+            "source_ref": "pbp",
+            "requested_scope": {"datasets": ["play_by_play_parquet"], "seasons": [2023]},
+            "config": {"require_360": False},
+            "resolved_plan": [
+                {
+                    "logical_name": "play_by_play_2023",
+                    "url": "http://example.invalid/asset",
+                    "dest_path": "nflverse/pbp/play_by_play_2023.parquet",
+                    "expected_type": "parquet",
+                    "expected_size_bytes": 1,
+                    "sha256": None,
+                    "group": "play_by_play_parquet",
+                    "optional": False,
+                }
+            ],
+            "results": {"status": "success", "downloaded_files": 0, "skipped_files": 0, "failed_files": 0, "errors": []},
+            "environment": {},
+            "terms_and_attribution": {},
+        }
+        (ingest_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        (ingest_dir / "checksums.json").write_text(json.dumps({}), encoding="utf-8")
+        ok, errs = verify_ingestion_integrity(ingest_dir)
+        codes = {err.get("code") for err in errs}
+        self.assertFalse(ok)
+        self.assertIn(E_REQUIRED_ASSET_MISSING, codes)
+        self.assertIn(E_CHECKSUM_RECORD_MISSING, codes)
+
+    def test_build_dataset_fails_on_integrity(self):
+        ingest_dir = Path(self.tmp) / "ingest_build"
+        downloads_dir = ingest_dir / "downloads"
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "schema_version": "1",
+            "run_id": "run",
+            "started_at_utc": "now",
+            "finished_at_utc": "later",
+            "source": "nflverse",
+            "source_ref": "pbp",
+            "requested_scope": {"datasets": ["play_by_play_parquet"], "seasons": [2023]},
+            "config": {"require_360": False},
+            "resolved_plan": [
+                {
+                    "logical_name": "play_by_play_2023",
+                    "url": "http://example.invalid/asset",
+                    "dest_path": "nflverse/pbp/play_by_play_2023.parquet",
+                    "expected_type": "parquet",
+                    "expected_size_bytes": 1,
+                    "sha256": None,
+                    "group": "play_by_play_parquet",
+                    "optional": False,
+                }
+            ],
+            "results": {"status": "success", "downloaded_files": 0, "skipped_files": 0, "failed_files": 0, "errors": []},
+            "environment": {},
+            "terms_and_attribution": {},
+        }
+        (ingest_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        (ingest_dir / "checksums.json").write_text(json.dumps({}), encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(cli, ["build-dataset", "--ingest-dir", str(ingest_dir)])
+        self.assertNotEqual(result.exit_code, 0)
 
     def test_rejects_unsafe_dest_path(self):
         scope = {"datasets": ["play_by_play_parquet"], "seasons": [2023]}
@@ -273,6 +402,7 @@ class TestIntegration(unittest.TestCase):
         ingest_dir = out_dir / "nflverse" / source_ref_for_path / scope_fp
         escape_path = ingest_dir / "escape.txt"
         self.assertFalse(escape_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

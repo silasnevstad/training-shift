@@ -3,18 +3,39 @@ from __future__ import annotations
 import hashlib
 import os
 import random
+import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
 from .errors import (
     SBError,
-    E_HTTP_404, E_HTTP_403, E_HTTP_429, E_TIMEOUT, E_CONNECTION, E_HTTP_5XX,
-    E_TRUNCATED_DOWNLOAD, E_ATOMIC_RENAME_FAILED,
+    E_HTTP_404,
+    E_HTTP_403,
+    E_HTTP_429,
+    E_TIMEOUT,
+    E_CONNECTION,
+    E_HTTP_5XX,
+    E_TRUNCATED_DOWNLOAD,
+    E_ATOMIC_RENAME_FAILED,
 )
+
+
+def _debug_enabled() -> bool:
+    v = os.getenv("SHIFTBENCH_DEBUG", "")
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dbg(event: str, **fields):
+    if not _debug_enabled():
+        return
+    payload = {"ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "component": "shiftbench.http", "event": event}
+    payload.update(fields)
+    sys.stderr.write(str(payload) + "\n")
+
 
 @dataclass
 class DownloadResult:
@@ -31,15 +52,24 @@ def _http_error_to_sberr(e: urllib.error.HTTPError, url: str) -> SBError:
         return SBError(E_HTTP_403, "HTTP 403", detail=str(e), url=url, retryable=False, severity="error")
     if code == 429:
         ra = e.headers.get("Retry-After")
-        return SBError(E_HTTP_429, "HTTP 429 rate limited", detail={"error": str(e), "retry_after": ra}, url=url, retryable=True, severity="error")
+        return SBError(
+            E_HTTP_429,
+            "HTTP 429 rate limited",
+            detail={"error": str(e), "retry_after": ra},
+            url=url,
+            retryable=True,
+            severity="error",
+        )
     if 500 <= code <= 599:
         return SBError(E_HTTP_5XX, f"HTTP {code}", detail=str(e), url=url, retryable=True, severity="error")
     return SBError(f"E_HTTP_{code}", f"HTTP {code}", detail=str(e), url=url, retryable=False, severity="error")
+
 
 def _compute_backoff(attempt: int, base: float = 1.0, factor: float = 2.0, jitter: float = 0.2, max_delay: float = 60.0) -> float:
     delay = min(max_delay, base * (factor ** (attempt - 1)))
     j = 1.0 + random.uniform(-jitter, jitter)
     return max(0.0, delay * j)
+
 
 def stream_download(
     url: str,
@@ -97,6 +127,8 @@ def stream_download(
                         for chunk in iter(lambda: f.read(1024 * 1024), b""):
                             h.update(chunk)
 
+            _dbg("request", attempt=attempt, url=url, start_at=start_at, headers=req_headers)
+
             req = urllib.request.Request(url, headers=req_headers, method="GET")
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                 content_length_header = resp.headers.get("Content-Length")
@@ -106,13 +138,17 @@ def stream_download(
                     content_length = None
                 content_range = _parse_content_range(resp.headers.get("Content-Range"))
 
+                _dbg("response", attempt=attempt, url=url, status=int(resp.status), content_length=content_length, content_range=content_range)
+
                 if start_at > 0 and resp.status == 200:
+                    # Server ignored Range; reset and retry
                     start_at = 0
                     h = hashlib.sha256()
                     try:
                         partial.unlink()
                     except FileNotFoundError:
                         pass
+                    _dbg("range_ignored_reset", attempt=attempt, url=url)
                     continue
 
                 if start_at > 0:
@@ -182,7 +218,14 @@ def stream_download(
                 expected_total = content_length + start_at if start_at > 0 else content_length
 
             if bytes_written < min_size_bytes:
-                raise SBError(E_TRUNCATED_DOWNLOAD, "Truncated/empty download", detail={"bytes": bytes_written}, url=url, retryable=True, severity="error")
+                raise SBError(
+                    E_TRUNCATED_DOWNLOAD,
+                    "Truncated/empty download",
+                    detail={"bytes": bytes_written},
+                    url=url,
+                    retryable=True,
+                    severity="error",
+                )
 
             if expected_total is None:
                 raise SBError(
@@ -212,10 +255,19 @@ def stream_download(
             try:
                 os.replace(partial, dest_path)
             except OSError as e:
-                raise SBError(E_ATOMIC_RENAME_FAILED, "Atomic rename failed", detail=str(e), url=url, path=str(dest_path), retryable=False, severity="fatal")
+                raise SBError(
+                    E_ATOMIC_RENAME_FAILED,
+                    "Atomic rename failed",
+                    detail=str(e),
+                    url=url,
+                    path=str(dest_path),
+                    retryable=False,
+                    severity="fatal",
+                )
 
             st = dest_path.stat()
             mtime_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime))
+            _dbg("success", url=url, dest=str(dest_path), size_bytes=st.st_size)
             return DownloadResult(sha256=h.hexdigest(), size_bytes=st.st_size, mtime_utc=mtime_utc, skipped=False)
 
         except urllib.error.HTTPError as e:
@@ -225,35 +277,65 @@ def stream_download(
                 except FileNotFoundError:
                     pass
                 if attempt < max_attempts:
-                    time.sleep(_compute_backoff(attempt))
+                    d = _compute_backoff(attempt)
+                    _dbg("http_416_reset_sleep", attempt=attempt, url=url, sleep_seconds=float(d))
+                    time.sleep(d)
                     continue
+
             sb = _http_error_to_sberr(e, url)
+            _dbg("http_error", attempt=attempt, url=url, code=sb.code, detail=sb.detail)
+
             if sb.code == E_HTTP_429:
+                # IMPORTANT: do not cap Retry-After; sleep exactly that value if present.
+                ra_raw = None
+                try:
+                    ra_raw = e.headers.get("Retry-After")
+                except Exception:
+                    ra_raw = None
                 ra = None
                 try:
-                    ra = int(e.headers.get("Retry-After") or "0")
+                    ra = int(ra_raw or "0")
                 except Exception:
                     ra = None
+
                 if ra and ra > 0:
-                    time.sleep(min(60, ra))
+                    _dbg("rate_limited_sleep", attempt=attempt, url=url, retry_after_raw=ra_raw, sleep_seconds=int(ra))
+                    time.sleep(ra)
                     continue
+
             if sb.retryable and attempt < max_attempts:
-                time.sleep(_compute_backoff(attempt))
+                d = _compute_backoff(attempt)
+                _dbg("retryable_sleep", attempt=attempt, url=url, sleep_seconds=float(d), code=sb.code)
+                time.sleep(d)
                 continue
+
             raise sb
 
         except urllib.error.URLError as e:
             msg = str(e.reason) if hasattr(e, "reason") else str(e)
             is_timeout = "timed out" in msg.lower()
-            sb = SBError(E_TIMEOUT if is_timeout else E_CONNECTION, "Network error", detail=msg, url=url, retryable=True, severity="error")
+            sb = SBError(
+                E_TIMEOUT if is_timeout else E_CONNECTION,
+                "Network error",
+                detail=msg,
+                url=url,
+                retryable=True,
+                severity="error",
+            )
+            _dbg("url_error", attempt=attempt, url=url, msg=msg, timeout=is_timeout)
             if attempt < max_attempts:
-                time.sleep(_compute_backoff(attempt))
+                d = _compute_backoff(attempt)
+                _dbg("retryable_sleep", attempt=attempt, url=url, sleep_seconds=float(d), code=sb.code)
+                time.sleep(d)
                 continue
             raise sb
 
         except SBError as e:
+            _dbg("sberror", attempt=attempt, url=url, code=e.code, detail=e.detail, retryable=e.retryable)
             if e.retryable and attempt < max_attempts:
-                time.sleep(_compute_backoff(attempt))
+                d = _compute_backoff(attempt)
+                _dbg("retryable_sleep", attempt=attempt, url=url, sleep_seconds=float(d), code=e.code)
+                time.sleep(d)
                 continue
             raise
 

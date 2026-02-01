@@ -4,6 +4,7 @@ import shutil
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest import mock
 
 from shiftbench.errors import SBError, E_TRUNCATED_DOWNLOAD
 from shiftbench.http import stream_download
@@ -106,7 +107,8 @@ class TestStreamDownload(unittest.TestCase):
         partial.parent.mkdir(parents=True, exist_ok=True)
         partial.write_bytes(body[:5])
 
-        res = stream_download(f"{base}/asset", dest, max_attempts=2, expected_size_bytes=len(body))
+        with mock.patch("shiftbench.http.time.sleep"), mock.patch("shiftbench.http._compute_backoff", return_value=0.0):
+            res = stream_download(f"{base}/asset", dest, max_attempts=2, expected_size_bytes=len(body))
         self.assertEqual(res.size_bytes, len(body))
         self.assertTrue(dest.exists())
         self.assertEqual(dest.read_bytes(), body)

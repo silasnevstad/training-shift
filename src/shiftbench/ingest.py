@@ -5,9 +5,21 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 
-from .errors import SBError, E_HTTP_404, E_FLOATING_REF_DISALLOWED, E_UNSAFE_DEST_PATH
+from .errors import (
+    SBError,
+    E_HTTP_404,
+    E_FLOATING_REF_DISALLOWED,
+    E_UNSAFE_DEST_PATH,
+    E_JSON_PARSE,
+    E_CHECKSUM_MISMATCH,
+    E_MANIFEST_MISSING,
+    E_CHECKSUMS_MISSING,
+    E_REQUIRED_ASSET_MISSING,
+    E_CHECKSUM_RECORD_MISSING,
+    E_FILE_MISSING,
+)
 from .util import (
     utc_now_iso,
     scope_fingerprint,
@@ -473,56 +485,232 @@ def verify_ingestion_integrity(
         resolved_plan: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[bool, List[Dict[str, Any]]]:
     errors: List[Dict[str, Any]] = []
+    manifest_path = ingest_dir / "manifest.json"
     checksums_path = ingest_dir / "checksums.json"
     downloads_dir = ingest_dir / "downloads"
+
+    def _err(e: SBError) -> Dict[str, Any]:
+        return e.to_manifest_record()
+
+    if not manifest_path.exists():
+        return False, [_err(SBError(
+            E_MANIFEST_MISSING,
+            "manifest.json missing",
+            detail={"path": str(manifest_path)},
+            path=str(manifest_path),
+            retryable=False,
+            severity="fatal",
+        ))]
     if not checksums_path.exists():
-        errors.append({"code": "E_CHECKSUMS_MISSING", "message": "checksums.json missing", "detail": None})
-        return False, errors
-    checksums = json.loads(checksums_path.read_text(encoding="utf-8"))
-    ok = True
-    for dest_rel, rec in checksums.items():
-        try:
-            dest = _safe_download_path(downloads_dir, str(dest_rel))
-        except SBError as e:
-            ok = False
-            errors.append(e.to_manifest_record())
+        return False, [_err(SBError(
+            E_CHECKSUMS_MISSING,
+            "checksums.json missing",
+            detail={"path": str(checksums_path)},
+            path=str(checksums_path),
+            retryable=False,
+            severity="fatal",
+        ))]
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        return False, [_err(SBError(
+            E_JSON_PARSE,
+            "manifest.json invalid JSON",
+            detail={"error": str(e), "path": str(manifest_path)},
+            path=str(manifest_path),
+            retryable=False,
+            severity="fatal",
+        ))]
+
+    try:
+        checksums = json.loads(checksums_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        return False, [_err(SBError(
+            E_JSON_PARSE,
+            "checksums.json invalid JSON",
+            detail={"error": str(e), "path": str(checksums_path)},
+            path=str(checksums_path),
+            retryable=False,
+            severity="fatal",
+        ))]
+
+    if not isinstance(checksums, dict):
+        return False, [_err(SBError(
+            E_JSON_PARSE,
+            "checksums.json must be an object mapping dest_path -> checksum record",
+            detail={"path": str(checksums_path), "type": str(type(checksums))},
+            path=str(checksums_path),
+            retryable=False,
+            severity="fatal",
+        ))]
+
+    # Standalone behavior: if manifest has config.require_360, honor it; otherwise use the argument.
+    config = manifest.get("config") or {}
+    require_360 = bool(require_360) or bool(config.get("require_360", False))
+
+    plan = resolved_plan if resolved_plan is not None else (manifest.get("resolved_plan") or [])
+
+    if not isinstance(plan, list):
+        return False, [_err(SBError(
+            E_JSON_PARSE,
+            "manifest.resolved_plan must be a list",
+            detail={"type": str(type(plan)), "path": str(manifest_path)},
+            path=str(manifest_path),
+            retryable=False,
+            severity="fatal",
+        ))]
+
+    # Index plan items by dest_path (for O(1) lookups). Skip placeholders with empty dest_path.
+    plan_by_dest: Dict[str, Dict[str, Any]] = {}
+    for item in plan:
+        if not isinstance(item, dict):
             continue
-        if not dest.exists():
-            ok = False
-            errors.append(
-                {"code": "E_FILE_MISSING", "message": "Downloaded file missing", "detail": {"dest_path": dest_rel}})
+        dest_rel = str(item.get("dest_path") or "")
+        if not dest_rel:
             continue
-        sha = _hash_file_sha256(dest)
-        if sha != rec.get("sha256"):
-            ok = False
-            errors.append({"code": "E_CHECKSUM_MISMATCH", "message": "Checksum mismatch",
-                           "detail": {"dest_path": dest_rel, "expected": rec.get("sha256"), "actual": sha}})
-    if require_360:
-        for item in resolved_plan or []:
-            if item.get("group") != "three-sixty":
-                continue
+        # Defensive: if duplicates occur, keep the first but record an error for auditability.
+        if dest_rel in plan_by_dest:
+            prev = plan_by_dest[dest_rel]
+            errors.append(_err(SBError(
+                E_JSON_PARSE,
+                "Duplicate dest_path in resolved_plan",
+                detail={
+                    "dest_path": dest_rel,
+                    "logical_name_a": prev.get("logical_name"),
+                    "logical_name_b": item.get("logical_name"),
+                },
+                retryable=False,
+                severity="error",
+            )))
+            continue
+        plan_by_dest[dest_rel] = item
+
+        def _is_required(item: Dict[str, Any]) -> bool:
+            # Required means: non-optional, OR (three-sixty group AND require_360)
+            if not isinstance(item, dict):
+                return False
             dest_rel = str(item.get("dest_path") or "")
             if not dest_rel:
-                continue
+                return False
+            optional = bool(item.get("optional", False))
+            if not optional:
+                return True
+            group = str(item.get("group") or "")
+            return (group == "three-sixty") and require_360
+
+        required_items: List[Tuple[str, Dict[str, Any]]] = []
+        for dest_rel, item in plan_by_dest.items():
+            if _is_required(item):
+                required_items.append((dest_rel, item))
+
+        # 1) Enforce plan completeness: required plan items must exist + be checksummed + match.
+        for dest_rel, item in required_items:
+            logical_name = item.get("logical_name")
+            group = item.get("group")
             try:
                 dest = _safe_download_path(downloads_dir, dest_rel)
             except SBError as e:
-                ok = False
                 errors.append(e.to_manifest_record())
                 continue
+
             if not dest.exists():
-                ok = False
-                errors.append({
-                    "code": "E_REQUIRED_ASSET_MISSING",
-                    "message": "Required three-sixty asset missing",
-                    "detail": {"dest_path": dest_rel},
-                })
+                errors.append(_err(SBError(
+                    E_REQUIRED_ASSET_MISSING,
+                    "Required asset missing",
+                    detail={"dest_path": dest_rel, "logical_name": logical_name,
+                            "group": group},
+                    path=str(dest),
+                    retryable=False,
+                    severity="error",
+                )))
+
+            rec = checksums.get(dest_rel)
+            if not isinstance(rec, dict):
+                errors.append(_err(SBError(
+                    E_CHECKSUM_RECORD_MISSING,
+                    "Checksum record missing for required asset",
+                    detail={"dest_path": dest_rel, "logical_name": logical_name,
+                            "group": group},
+                    retryable=False,
+                    severity="error",
+                )))
                 continue
-            if dest_rel not in checksums:
-                ok = False
-                errors.append({
-                    "code": "E_CHECKSUM_RECORD_MISSING",
-                    "message": "Checksum record missing for required asset",
-                    "detail": {"dest_path": dest_rel},
-                })
-    return ok, errors
+
+            if dest.exists():
+                sha = _hash_file_sha256(dest)
+                expected = rec.get("sha256")
+                if not expected or sha != expected:
+                    errors.append(_err(SBError(
+                        E_CHECKSUM_MISMATCH,
+                        "Checksum mismatch",
+                        detail={"dest_path": dest_rel, "logical_name": logical_name,
+                                "expected": expected, "actual": sha},
+                        path=str(dest),
+                        retryable=False,
+                        severity="error",
+                    )))
+
+    # 2) Validate all checksum entries: if checksums says a file exists, it must exist and hash must match.
+    # This applies even to optional assets; corruption is corruption.
+    for dest_rel, rec in checksums.items():
+        if not isinstance(dest_rel, str):
+            continue
+        if not isinstance(rec, dict):
+            errors.append(_err(SBError(
+                E_JSON_PARSE,
+                "Invalid checksums record shape; expected object",
+                detail={"dest_path": str(dest_rel), "type": str(type(rec))},
+                retryable=False,
+                severity="error",
+            )))
+            continue
+
+        item = plan_by_dest.get(dest_rel) or {}
+        logical_name = item.get("logical_name")
+        try:
+            dest = _safe_download_path(downloads_dir, dest_rel)
+        except SBError as e:
+            errors.append(e.to_manifest_record())
+            continue
+
+        if not dest.exists():
+            errors.append(_err(SBError(
+                E_FILE_MISSING,
+                "Downloaded file missing (present in checksums.json)",
+                detail={"dest_path": dest_rel,
+                        "logical_name": logical_name},
+                path=str(dest),
+                retryable=False,
+                severity="error",
+            )))
+            continue
+
+        sha = _hash_file_sha256(dest)
+        expected = rec.get("sha256")
+        if not expected or sha != expected:
+            errors.append(_err(SBError(
+                E_CHECKSUM_MISMATCH,
+                "Checksum mismatch",
+                detail={"dest_path": dest_rel,
+                        "logical_name": logical_name,
+                        "expected": expected, "actual": sha},
+                path=str(dest),
+                retryable=False,
+                severity="error",
+            )))
+
+    # Deterministic ordering for stable CI output and user-facing JSON.
+    def _error_key(err: Dict[str, Any]) -> Tuple[str, str, str]:
+        code = str(err.get("code") or "")
+        detail = err.get("detail") or {}
+        # SBError.to_manifest_record wraps non-dict detail into {"detail": ..., "retryable": ..., "severity": ...}
+        logical = ""
+        dest = ""
+        if isinstance(detail, dict):
+            logical = str(detail.get("logical_name") or "")
+            dest = str(detail.get("dest_path") or "")
+        return code, logical, dest
+
+    errors = sorted(errors, key=_error_key)
+    return (len(errors) == 0), errors
